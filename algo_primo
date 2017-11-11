@@ -1,0 +1,292 @@
+from quantopian.pipeline import Pipeline
+# from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline.data import morningstar as mstar
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import CustomFactor, SimpleMovingAverage, AverageDollarVolume
+from quantopian.pipeline.factors import Latest, RSI, Returns, BusinessDaysSincePreviousEvent
+from quantopian.pipeline.filters.morningstar import Q1500US, IsPrimaryShare
+
+from quantopian.pipeline.classifiers.morningstar import Sector
+from quantopian.pipeline.data.psychsignal import stocktwits
+from quantopian.pipeline.data.zacks import EarningsSurprises
+from quantopian.research import run_pipeline
+
+
+import numpy as np
+import pandas as pd
+
+
+#from quantopian.pipeline.data.estimize import
+#from quantopian.pipeline.data.eventvestor import 
+#from quantopian.pipeline.data.quandl import
+#from quantopian.pipeline.data.sentdex import
+
+
+
+# Defining my CustomFactors
+
+class Value(CustomFactor):
+    
+    inputs = [mstar.valuation_ratios.book_value_yield,
+              mstar.valuation_ratios.sales_yield,
+              mstar.valuation_ratios.fcf_yield] 
+    
+    window_length = 1
+    
+    def compute(self, today, assets, out, book_value, sales, fcf):
+        value_table = pd.DataFrame(index=assets)
+        value_table["book_value"] = book_value[-1]
+        value_table["sales"] = sales[-1]
+        value_table["fcf"] = fcf[-1]
+        out[:] = value_table.rank().mean(axis=1)
+
+class Momentum(CustomFactor):
+    
+    inputs = [USEquityPricing.close]
+    window_length = 252
+    
+    def compute(self, today, assets, out, close):       
+        out[:] = close[-20] / close[0]
+        
+    
+class PE_Ratio(CustomFactor):
+    inputs= [mstar.valuation_ratios.pe_ratio.latest]
+    window_length = 1
+    
+    def compute(self, today, assets, out, latest):
+        out[:] = latest[-1]
+    
+    
+class MessageVolume(CustomFactor):
+    inputs = [stocktwits.total_scanned_messages]
+    window_length = 21
+    def compute(self, today, assets, out, msgs):
+        out[:] = -np.nansum(msgs, axis=0)
+
+        
+class MarketCap(CustomFactor):
+    # Pre-declare inputs and window_length
+    inputs = [USEquityPricing.close, mstar.valuation.shares_outstanding]
+    window_length = 1
+
+    # Compute market cap value
+    def compute(self, today, assets, out, close, shares):
+        out[:] = close[-1] * shares[-1]
+
+
+
+
+def initialize(context):
+    # Schedule our rebalance function to run at the start of each week.
+    schedule_function(my_rebalance, date_rules.week_start(), time_rules.market_open(hours=1),half_days = True)
+
+    # Record variables at the end of each day.
+    schedule_function(my_record_vars, date_rules.every_day(), time_rules.market_close(), half_days =True)
+
+    # Create our pipeline and attach it to our algorithm.
+    my_pipe = make_pipeline()
+    attach_pipeline(my_pipe, 'my_pipeline')
+    
+
+    context.long_leverage = 1.0
+    context.short_leverage = -1.0
+    context.spy = sid(8554)
+    
+    # Used to avoid purchasing any leveraged ETFs 
+    context.dont_buys = security_lists.leveraged_etf_list.current_securities(get_datetime())
+     
+     
+     
+     
+     
+     # Make pipeline
+
+def make_pipeline():
+    """
+    Create and return our pipeline.
+
+    """
+
+    pipe = Pipeline()
+    
+    # Initial universe set to the Q1500US.
+    # initial_screen = filter_universe()
+    initial_universe = Q1500US()
+    
+    # 10-day and 30-day close price average, and percent diff.
+    mean_10 = SimpleMovingAverage(inputs=[USEquityPricing.close], window_length=10, mask=initial_universe)
+    mean_30 = SimpleMovingAverage(inputs=[USEquityPricing.close], window_length=30, mask=initial_universe)
+    neg_percent_diff = ( mean_30 - mean_10 ) / mean_30
+      
+    
+
+    factors = {
+        "Message": MessageVolume(mask=initial_universe),
+        "Momentum": Momentum(mask=initial_universe),
+        "Value": Value(mask=initial_universe),
+        "Moving Average": neg_percent_diff,
+
+    }
+    
+    clean_factors = None
+    for name, factor in factors.items():
+        if not clean_factors:
+            clean_factors = factor.isfinite()
+        else:
+            clean_factors = clean_factors & factor.isfinite()  
+            
+    combined_rank = None
+    for name, factor in factors.items():
+        if not combined_rank:
+            combined_rank = factor.rank(mask=clean_factors)
+        else:
+            combined_rank += factor.rank(mask=clean_factors)
+    pipe.add(combined_rank, 'factor')
+
+    # Build Filters representing the top and bottom 200 stocks by our combined ranking system.
+    # We'll use these as our tradeable universe each day.
+    longs = combined_rank.percentile_between(80, 90)
+    shorts = combined_rank.percentile_between(10, 20)
+    
+    pipe.set_screen(longs | shorts)
+    
+    pipe.add(longs, 'longs')
+    pipe.add(shorts, 'shorts')
+    return pipe
+
+
+
+def my_compute_weights(context):
+    """
+    Compute ordering weights.
+    """
+    # Compute even target weights for our long positions and short positions.
+    long_weight = 0.5 / len(context.longs)
+    short_weight = -0.5 / len(context.shorts)
+
+    return long_weight, short_weight
+
+def before_trading_start(context, data):
+    # Call pipeline_output to get the output
+    # Note this is a dataframe where the index is the SIDs for all 
+    # securities to pass my screen and the columns are the factors which
+    output = pipeline_output('ranking_example')
+    ranks = output['factor']
+    
+    long_ranks = ranks[output['longs']].rank()
+    short_ranks = ranks[output['shorts']].rank()
+
+    context.long_weights = (long_ranks / long_ranks.sum())
+    log.info("Long Weights:")
+    log.info(context.long_weights)
+    
+    context.short_weights = (short_ranks / short_ranks.sum())
+    log.info("Short Weights:")
+    log.info(context.short_weights)
+    
+    context.active_portfolio = context.long_weights.index.union(context.short_weights.index)
+    
+def before_trading_start(context, data):
+    # Gets our pipeline output every day.
+    context.output = pipeline_output('my_pipeline')
+
+    # Go long in securities for which the 'longs' value is True.
+    context.longs = context.output[context.output['longs']].index.tolist()
+
+    # Go short in securities for which the 'shorts' value is True.
+    context.shorts = context.output[context.output['shorts']].index.tolist()
+
+    context.long_weight, context.short_weight = my_compute_weights(context)
+
+
+
+
+
+
+# This function is scheduled to run at the start of each month.
+           
+
+def my_rebalance(context, data):
+    """
+    Rebalance weekly.
+    """
+            
+    """
+    Allocate our long/short portfolio based on the weights supplied by
+    context.long_weights and context.short_weights.
+    """
+    # Order our longs.
+    log.info("ordering longs")
+    for long_stock, long_weight in context.long_weights.iterkv():
+        if data.can_trade(long_stock):
+            if long_stock in context.dont_buys:
+                continue
+            order_target_percent(long_stock, context.long_leverage * long_weight)
+    
+    # Order our shorts.
+    log.info("ordering shorts")
+    for short_stock, short_weight in context.short_weights.iterkv():
+        if data.can_trade(short_stock):
+            if short_stock in context.dont_buys:
+                continue
+            order_target_percent(short_stock, context.short_leverage * short_weight)
+    
+    # Sell any positions in assets that are no longer in our target portfolio.
+    for security in context.portfolio.positions:
+        if data.can_trade(security):  # Work around inability to sell de-listed stocks.
+            if security not in context.active_portfolio:
+                order_target_percent(security, 0)
+                
+                
+                
+                
+                
+def check_positions_for_loss_or_profit(context, data):
+    # Sell our positions on longs/shorts for profit or loss
+    for security in context.portfolio.positions:
+        is_stock_held = context.stocks_held.get(security) >= 0
+        if data.can_trade(security) and is_stock_held and not get_open_orders(security):
+            current_position = context.portfolio.positions[security].amount  
+            cost_basis = context.portfolio.positions[security].cost_basis  
+            price = data.current(security, 'price')
+            # On Long & Profit
+            if price >= cost_basis * 1.10 and current_position > 0:  
+                order_target_percent(security, 0)  
+                log.info( str(security) + ' Sold Long for Profit')  
+                del context.stocks_held[security]  
+            # On Short & Profit
+            if price <= cost_basis* 0.90 and current_position < 0:
+                order_target_percent(security, 0)  
+                log.info( str(security) + ' Sold Short for Profit')  
+                del context.stocks_held[security]
+            # On Long & Loss
+            if price <= cost_basis * 0.90 and current_position > 0:  
+                order_target_percent(security, 0)  
+                log.info( str(security) + ' Sold Long for Loss')  
+                del context.stocks_held[security]  
+            # On Short & Loss
+            if price >= cost_basis * 1.10 and current_position < 0:  
+                order_target_percent(security, 0)  
+                log.info( str(security) + ' Sold Short for Loss')  
+                del context.stocks_held[security]  
+                
+                
+                
+def record_vars(context, data):  
+    """
+    Record variables at the end of each day.
+    """
+    longs = shorts = 0
+    for position in context.portfolio.positions.itervalues():
+        if position.amount > 0:
+            longs += 1
+        elif position.amount < 0:
+            shorts += 1
+
+    
+    # Record and plot the leverage, number of positions, and exposure of our portfolio over time. 
+    record(num_positions=len(context.portfolio.positions),
+           exposure=context.account.net_leverage, 
+           leverage=context.account.leverage,
+           long_count = longs,
+          short_count= shorts)   
